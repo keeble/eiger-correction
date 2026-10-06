@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
+
+# Raw detector and scan inputs are supplied locally, not committed.
+/data/*
+!/data/README.md
+
+# Calibration products and processed results are generated locally.
+/outputs/*
+!/outputs/.gitkeep
