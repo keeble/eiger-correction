@@ -10,3 +10,4 @@ __pycache__/
 # Calibration products and processed results are generated locally.
 /outputs/*
 !/outputs/.gitkeep
+!/outputs/i15-1-99877_detector_corrections.h5
