@@ -3,7 +3,8 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Raw detector and scan inputs are supplied locally, not committed.
-/data/*
+/data/*h5
+/data/*nxs
 !/data/README.md
 
 # Calibration products and processed results are generated locally.
