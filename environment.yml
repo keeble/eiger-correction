@@ -1,0 +1,13 @@
+name: eiger-correction
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - numpy>=2,<2.3
+  - scipy
+  - h5py
+  - matplotlib
+  - pyfai=2024.9.0
+  - xraylib
+  - ipykernel
+  - jupyterlab
