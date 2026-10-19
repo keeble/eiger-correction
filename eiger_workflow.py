@@ -54,8 +54,13 @@ def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
     with h5py.File(path, "r") as file:
         angles = _array(file, "entry/fastcs_eiger/tth").astype(float).reshape(-1)
         calibration = file["entry/plan_metadata/geometry_calibration"]
-        orientation = int(_array(calibration, "detector_config/orientation"))
-        wavelength = float(_array(calibration, "wavelength"))
+        if isinstance(calibration, h5py.Dataset):
+            calibration_config = json.loads(_text(calibration[()]))
+            orientation = int(calibration_config["detector_config"]["orientation"])
+            wavelength = float(calibration_config["wavelength"])
+        else:
+            orientation = int(_array(calibration, "detector_config/orientation"))
+            wavelength = float(_array(calibration, "wavelength"))
         nexus_mask = _array(file, "entry/instrument/fastcs_eiger/pixel_mask") if "entry/instrument/fastcs_eiger/pixel_mask" in file else None
         if not detector_path.exists():
             detector_path, detector_dataset = path, "entry/fastcs_eiger/data"
