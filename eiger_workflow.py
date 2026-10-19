@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import json
 import tempfile
@@ -84,6 +84,75 @@ def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
     return Scan(path, detector_path.resolve(), detector_dataset, angles, i0, mask, energy, thickness, material, orientation, wavelength, shape[1:])
 
 
+def aggregate_equal_angle_frames(scan, output_path, saturation=1e7, angle_tolerance=0.0):
+    """Sum equal or tolerance-matched angle frames and I0 into a compact file.
+
+    A detector pixel is retained in an aggregate only when every constituent
+    frame has a finite, nonnegative, nonsaturated value at that pixel. This
+    avoids treating a missing/saturated frame as a zero-count measurement.
+    The original scan files are never modified.
+    """
+    output_path = Path(output_path).resolve()
+    if output_path.exists():
+        raise FileExistsError(f"Refusing to overwrite aggregated data: {output_path}")
+    if not np.isfinite(saturation) or saturation <= 0:
+        raise ValueError("saturation must be finite and positive")
+    if not np.isfinite(angle_tolerance) or angle_tolerance < 0:
+        raise ValueError("angle_tolerance must be finite and nonnegative")
+
+    unique_angles, inverse = np.unique(scan.angles, return_inverse=True)
+    angle_clusters = []
+    for angle_index, angle in enumerate(unique_angles):
+        if not angle_clusters or angle - unique_angles[angle_clusters[-1][0]] > angle_tolerance:
+            angle_clusters.append([angle_index])
+        else:
+            angle_clusters[-1].append(angle_index)
+    cluster_for_angle = np.empty(len(unique_angles), dtype=np.int32)
+    for cluster_index, cluster in enumerate(angle_clusters):
+        cluster_for_angle[cluster] = cluster_index
+    group_for_frame = cluster_for_angle[inverse]
+    group_members = [np.flatnonzero(group_for_frame == group_index) for group_index in range(len(angle_clusters))]
+    grouped_i0 = np.array([scan.i0[members].sum() for members in group_members], dtype=float)
+    grouped_angles = np.array([
+        np.average(scan.angles[members], weights=scan.i0[members]) for members in group_members
+    ], dtype=float)
+    if not np.all(np.isfinite(grouped_i0) & (grouped_i0 > 0)):
+        raise ValueError("Aggregated I0 values must be finite and positive")
+
+    with h5py.File(scan.detector_path, "r") as source, h5py.File(output_path, "x") as target:
+        source_data = source[scan.detector_dataset]
+        aggregated = target.create_dataset(
+            "data", shape=(len(angle_clusters), *scan.shape), dtype=np.float64,
+            chunks=(1, *scan.shape), compression="lzf",
+        )
+        for group_index, members in enumerate(group_members):
+            total = np.zeros(scan.shape, dtype=np.float64)
+            invalid = np.zeros(scan.shape, dtype=bool)
+            for frame_index in members:
+                frame = np.asarray(source_data[int(frame_index)], dtype=np.float64)
+                frame_invalid = ~np.isfinite(frame) | (frame < 0) | (frame >= saturation)
+                invalid |= frame_invalid
+                total += np.where(frame_invalid, 0.0, frame)
+            total[invalid] = np.nan
+            aggregated[group_index] = total
+
+        offsets = np.zeros(len(group_members) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum([len(members) for members in group_members])
+        target.create_dataset("group_offsets", data=offsets)
+        target.create_dataset("source_frame_indices", data=np.concatenate(group_members))
+        target.attrs["aggregation"] = "angle-group raw-count sum; I0 summed; any invalid constituent masks that pixel"
+        target.attrs["angle_tolerance_deg"] = angle_tolerance
+        target.attrs["source_scan"] = str(scan.path)
+
+    return replace(
+        scan,
+        detector_path=output_path,
+        detector_dataset="data",
+        angles=grouped_angles,
+        i0=grouped_i0,
+    ), group_members
+
+
 def detector_layout(shape):
     if shape != (512, 1028):
         raise ValueError("Only the documented EIGER2 CdTe 500K layout is supported")
@@ -133,7 +202,7 @@ class PhysicalModel:
 
     def arrays(self, angle):
         integrator = self.geometry.get_ai(float(angle))
-        theta = integrator.twoThetaArray(self.shape)
+        theta = integrator.center_array(self.shape, unit="2th_rad")
         q_pixels = 4 * np.pi * np.sin(theta / 2) / (integrator.wavelength * 1e9)
         prefactor = integrator.pixel1 * integrator.pixel2 / integrator.dist**2
         absorption = integrator.calc_transmission(self.transmission, shape=self.shape) * self.efficiency
@@ -146,7 +215,8 @@ class PhysicalModel:
             integrator = self.geometry.get_ai(angle)
             ray_z, ray_y, ray_x = integrator.calc_pos_zyx(d1=np.array([255.5]), d2=np.array([513.5]))
             fraction = float(abs(ray_y[0]) / np.hypot(ray_x[0], ray_y[0]))
-            rows.append({"angle_deg": angle, "vertical_fraction": fraction, "chi_deg": float(np.rad2deg(integrator.chiArray(self.shape))[256, 514])})
+            chi = integrator.center_array(self.shape, unit="chi_rad")
+            rows.append({"angle_deg": angle, "vertical_fraction": fraction, "chi_deg": float(np.rad2deg(chi)[256, 514])})
             if fraction < 0.99:
                 raise ValueError("Geometry is not predominantly vertical: verify polarization convention before proceeding")
         return rows
@@ -351,7 +421,7 @@ def overlap_summary(results):
     return {"centered_overlap_percent": float(100 * np.median(centered)), "absolute_overlap_percent": float(100 * np.median(absolute))}
 
 
-def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range, npt):
+def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range, npt, saturation=1e7):
     results = {"physical_only": {}, "detector_only": {}, "lower_q_frame_gain": {}}
     high_q_scores = {label: [] for label in results}
     frame_rows = []
@@ -370,7 +440,7 @@ def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range,
             inferred_gain = float(np.exp(np.clip(np.median(residual[selected]), -0.05, 0.05)))
             counts = file[scan.detector_dataset][index]
             for label, divisor, gain in (("physical_only", np.ones(scan.shape), 1.0), ("detector_only", fit["combined_divisor"], 1.0), ("lower_q_frame_gain", fit["combined_divisor"], inferred_gain)):
-                result = integrate_frame(model, counts, scan.angles[index], scan.i0[index], base_mask | fit["bad_pixel_mask"], divisor, npt, q_range, frame_gain=gain)
+                result = integrate_frame(model, counts, scan.angles[index], scan.i0[index], base_mask | fit["bad_pixel_mask"], divisor, npt, q_range, frame_gain=gain, saturation=saturation)
                 results[label][index] = result
                 high = (np.arange(npt) > cutoff + 2) & (result.count >= 100) & (result.intensity > 0) & fit["supported_q_bins"]
                 if not high.any():
@@ -470,7 +540,7 @@ def process_scan(scan, calibration, model, q_range=(200, 400), q_npt=800, theta_
     lower, upper = np.inf, -np.inf
     for angle in scan.angles:
         integrator = model.geometry.get_ai(float(angle))
-        theta = np.rad2deg(integrator.twoThetaArray(scan.shape))
+        theta = np.rad2deg(integrator.center_array(scan.shape, unit="2th_rad"))
         lower, upper = min(lower, float(theta[~mask].min())), max(upper, float(theta[~mask].max()))
     results = {"merged_q": {}, "merged_2theta": {}}
     with h5py.File(scan.detector_path, "r") as file:
