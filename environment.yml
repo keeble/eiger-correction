@@ -6,6 +6,7 @@ dependencies:
   - numpy>=2,<2.3
   - scipy
   - h5py
+  - pandas
   - matplotlib
   - pyfai=2024.9.0
   - xraylib
