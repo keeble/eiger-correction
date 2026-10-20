@@ -90,6 +90,8 @@ def aggregate_equal_angle_frames(scan, output_path, saturation=1e7, angle_tolera
     A detector pixel is retained in an aggregate only when every constituent
     frame has a finite, nonnegative, nonsaturated value at that pixel. This
     avoids treating a missing/saturated frame as a zero-count measurement.
+    Group angles are arithmetic means of motor readings (one per frame),
+    independent of I0; summed I0 is used only for intensity normalization.
     The original scan files are never modified.
     """
     output_path = Path(output_path).resolve()
@@ -114,7 +116,7 @@ def aggregate_equal_angle_frames(scan, output_path, saturation=1e7, angle_tolera
     group_members = [np.flatnonzero(group_for_frame == group_index) for group_index in range(len(angle_clusters))]
     grouped_i0 = np.array([scan.i0[members].sum() for members in group_members], dtype=float)
     grouped_angles = np.array([
-        np.average(scan.angles[members], weights=scan.i0[members]) for members in group_members
+        np.mean(scan.angles[members]) for members in group_members
     ], dtype=float)
     if not np.all(np.isfinite(grouped_i0) & (grouped_i0 > 0)):
         raise ValueError("Aggregated I0 values must be finite and positive")
