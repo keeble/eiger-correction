@@ -525,8 +525,56 @@ def model_for_processing(scan, calibration):
     return model
 
 
+def theta_range_for_scan(scan, model, mask, theta_max=None):
+    """Return (0, maximum) 2theta degrees without reading detector counts.
+
+    The automatic maximum uses finite, unmasked pyFAI pixel centres over all
+    scan positions, not pixel corners or count-dependent frame masks.
+    """
+    message = "theta_max must be None or a finite number with 0 < theta_max <= 180 degrees"
+    if theta_max is not None:
+        if not isinstance(theta_max, (int, float, np.integer, np.floating)):
+            raise ValueError(message)
+        upper = float(theta_max)
+        if not np.isfinite(upper) or not 0 < upper <= 180:
+            raise ValueError(message)
+        return 0.0, upper
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != scan.shape:
+        raise ValueError("Theta-range mask must match the detector shape")
+    if np.all(mask):
+        raise ValueError("Cannot determine theta range: no unmasked pixels")
+    upper = -np.inf
+    for angle in scan.angles:
+        integrator = model.geometry.get_ai(float(angle))
+        theta = np.rad2deg(integrator.center_array(scan.shape, unit="2th_rad"))
+        valid = ~mask & np.isfinite(theta)
+        if np.any(valid):
+            upper = max(upper, float(theta[valid].max()))
+    if not np.isfinite(upper) or not 0 < upper <= 180:
+        raise ValueError("Cannot determine theta range: no finite, positive unmasked pyFAI maximum")
+    return 0.0, upper
+
+
 def process_scan(scan, calibration, model, q_range=(200, 400), q_npt=800, theta_npt=1000,
-                 apply_calibration_frame_gains=False, allow_extrapolation=True, saturation=1e7):
+                 apply_calibration_frame_gains=False, allow_extrapolation=True, saturation=1e7,
+                 theta_range=None):
+    """Integrate with optional explicit (lower, upper) 2theta limits in degrees.
+
+    None starts at zero and uses the maximum unmasked pyFAI pixel centre.
+    Explicit (lower, upper) tuples remain supported for existing callers.
+    """
+    if theta_range is not None:
+        message = "theta_range must be a finite (lower, upper) tuple with 0 <= lower < upper <= 180 degrees"
+        if not isinstance(theta_range, tuple) or len(theta_range) != 2:
+            raise ValueError(message)
+        try:
+            limits = np.asarray(theta_range, dtype=float)
+        except (TypeError, ValueError) as error:
+            raise ValueError(message) from error
+        if limits.shape != (2,) or not np.all(np.isfinite(limits)) or not 0 <= limits[0] < limits[1] <= 180:
+            raise ValueError(message)
+        lower, upper = map(float, limits)
     fit_range = calibration["fit_settings"]["q_range"]
     if not allow_extrapolation:
         raise ValueError("Full-range 2theta export extrapolates the fitted detector response; explicitly enable allow_extrapolation")
@@ -539,11 +587,8 @@ def process_scan(scan, calibration, model, q_range=(200, 400), q_npt=800, theta_
         gains = calibration["frame_gains"].copy()
     divisor = calibration["combined_divisor"]
     mask = calibration["base_mask"].astype(bool) | calibration["bad_pixel_mask"].astype(bool) | scan.native_mask
-    lower, upper = np.inf, -np.inf
-    for angle in scan.angles:
-        integrator = model.geometry.get_ai(float(angle))
-        theta = np.rad2deg(integrator.center_array(scan.shape, unit="2th_rad"))
-        lower, upper = min(lower, float(theta[~mask].min())), max(upper, float(theta[~mask].max()))
+    if theta_range is None:
+        lower, upper = theta_range_for_scan(scan, model, mask)
     results = {"merged_q": {}, "merged_2theta": {}}
     with h5py.File(scan.detector_path, "r") as file:
         for index, angle in enumerate(scan.angles):
