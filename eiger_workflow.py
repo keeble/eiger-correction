@@ -29,6 +29,31 @@ def _text(value):
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def geometry_from_scan(path):
+    """Read either a JSON scalar or a nested NeXus geometry group, read-only."""
+    def decode_node(node):
+        if isinstance(node, h5py.Group):
+            return {key: decode_node(node[key]) for key in node}
+        value = node[()]
+        if isinstance(value, np.ndarray):
+            return [decode_value(item) for item in value.tolist()] if value.ndim else decode_value(value.item())
+        return decode_value(value)
+
+    def decode_value(value):
+        if isinstance(value, bytes):
+            return value.decode()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    with h5py.File(path, "r") as file:
+        node = file["entry/plan_metadata/geometry_calibration"]
+        config = json.loads(_text(node[()])) if isinstance(node, h5py.Dataset) else decode_node(node)
+    if not isinstance(config, dict) or "detector_config" not in config or "wavelength" not in config:
+        raise ValueError("Invalid embedded goniometer geometry")
+    return config
+
+
 @dataclass
 class Scan:
     path: Path
@@ -51,11 +76,11 @@ def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
     monitor_path = Path(monitor_path) if monitor_path else path.with_name(path.stem + "-i0.h5")
     metadata_path = Path(metadata_path) if metadata_path else path.with_name(path.stem + "-fastcs_eiger_meta.h5")
     detector_dataset = "data"
+    geometry_config = geometry_from_scan(path)
     with h5py.File(path, "r") as file:
         angles = _array(file, "entry/fastcs_eiger/tth").astype(float).reshape(-1)
-        calibration = file["entry/plan_metadata/geometry_calibration"]
-        orientation = int(_array(calibration, "detector_config/orientation"))
-        wavelength = float(_array(calibration, "wavelength"))
+        orientation = int(geometry_config["detector_config"]["orientation"])
+        wavelength = float(geometry_config["wavelength"])
         nexus_mask = _array(file, "entry/instrument/fastcs_eiger/pixel_mask") if "entry/instrument/fastcs_eiger/pixel_mask" in file else None
         if not detector_path.exists():
             detector_path, detector_dataset = path, "entry/fastcs_eiger/data"
@@ -97,17 +122,17 @@ def detector_layout(shape):
     return boundaries, sensors
 
 
-def _geometry_from_config(config):
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
+def _geometry_from_config(config, temporary_directory=None):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir=temporary_directory) as file:
         json.dump(config, file)
         file.flush()
         return Goniometer.sload(file.name)
 
 
 class PhysicalModel:
-    def __init__(self, geometry_config, scan, polarization=0.95, density=6.2):
+    def __init__(self, geometry_config, scan, polarization=0.95, density=6.2, temporary_directory=None):
         self.config = geometry_config
-        self.geometry = _geometry_from_config(geometry_config)
+        self.geometry = _geometry_from_config(geometry_config, temporary_directory)
         if not np.isclose(self.geometry.wavelength, scan.wavelength_m, rtol=1e-6, atol=0):
             raise ValueError("Scan and geometry wavelengths do not match")
         if int(geometry_config["detector_config"]["orientation"]) != scan.orientation:
@@ -177,7 +202,7 @@ def build_cache(scan, model, base_mask, q_range=(200, 400), npt=800, saturation=
         for index, angle in enumerate(scan.angles):
             integrator, q_pixels, norm, absorption, prefactor = model.arrays(angle)
             counts = file[scan.detector_dataset][index]
-            valid = ~base_mask & np.isfinite(counts) & (counts < saturation)
+            valid = ~base_mask & np.isfinite(counts) & (counts >= 0) & (counts < saturation)
             valid &= (q_pixels >= q_range[0]) & (q_pixels < q_range[1])
             if valid.any():
                 pixels = np.flatnonzero(valid).astype(np.int32)
