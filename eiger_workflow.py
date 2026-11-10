@@ -423,8 +423,217 @@ def overlap_summary(results):
     return {"centered_overlap_percent": float(100 * np.median(centered)), "absolute_overlap_percent": float(100 * np.median(absolute))}
 
 
-def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range, npt, saturation=1e7):
-    results = {"physical_only": {}, "detector_only": {}, "lower_q_frame_gain": {}}
+def _position_accumulators(group):
+    """Validate the common axis and four-field position accumulator layout."""
+    try:
+        frames = np.asarray(group["per_frame"], dtype=float)
+        axis = np.asarray(group["axis"], dtype=float)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("group requires numeric per_frame and axis arrays") from error
+    if (frames.ndim != 3 or frames.shape[1] != 4 or frames.shape[0] == 0
+            or frames.shape[2] == 0):
+        raise ValueError("per_frame must have shape (positions, 4, bins), with nonempty positions/bins")
+    if axis.shape != (frames.shape[2],) or not np.all(np.isfinite(axis)):
+        raise ValueError("axis must be finite and match per_frame bins")
+    return frames
+
+
+def refine_position_scales(group, *, minimum_pixel_weight=100,
+                           minimum_overlap_bins=20, fractional_floor=0.003) -> dict:
+    """Fit one positive intensity divisor per position from same-bin overlaps.
+
+    ``group`` is a process_scan merged_2theta payload, integrated with UNITY
+    frame gains. This is a required caller precondition: a group alone does
+    not carry the processed-level gain provenance. No merged intensity, fit
+    range restriction, smoothing, prior, bounds or Q-dependent fit is used.
+
+    Each pair contributes one edge: the inverse-log-variance weighted mean
+    of log(I_i)-log(I_j). Its bin variance is V_i/S_i**2 + V_j/S_j**2
+    + fractional_floor**2, where S and V are the signal/variance accumulators.
+    The floor is strictly positive so zero raw variance remains well-defined.
+    Invalid/nonpositive intensities, negative/nonfinite variances, nonpositive
+    normalizations and insufficient pixel weights are excluded per sample.
+    Every position must belong to one connected overlap graph (at least two
+    positions); otherwise ValueError is raised without fallback.
+
+    Weighted graph least squares solves log(g_i)-log(g_j)=delta_ij, with
+    equal-position mean log(g)=0, so I_i/g_i is on a common scale. Edges share
+    observations and bins can be correlated: weights and residual RMS are
+    descriptive, NOT calibrated standard errors or independent validation.
+    Edge deltas, residuals and RMS diagnostics are in natural-log units;
+    n_pair_bins counts bin uses across pairs, not independent observations.
+    """
+    for name, value in (("minimum_pixel_weight", minimum_pixel_weight),
+                        ("fractional_floor", fractional_floor)):
+        if (isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, float, np.integer, np.floating))
+                or not np.isfinite(value) or value <= 0):
+            raise ValueError(f"{name} must be finite and positive")
+    if (isinstance(minimum_overlap_bins, (bool, np.bool_))
+            or not isinstance(minimum_overlap_bins, (int, np.integer))
+            or minimum_overlap_bins < 1):
+        raise ValueError("minimum_overlap_bins must be a positive integer")
+    with np.errstate(over="ignore", under="ignore", divide="ignore"):
+        floor_variance = np.square(float(fractional_floor))
+        inverse_floor = np.divide(1.0, floor_variance)
+    if not np.isfinite(floor_variance) or floor_variance <= 0 or not np.isfinite(inverse_floor):
+        raise ValueError("fractional_floor squared must have a finite positive inverse")
+
+    frames = _position_accumulators(group)
+    n_positions = frames.shape[0]
+    if n_positions < 2:
+        raise ValueError("Overlap refinement requires at least two connected positions")
+    signal, normalization, variance, count = (frames[:, index] for index in range(4))
+    valid = (np.all(np.isfinite(frames), axis=1) & (signal > 0)
+             & (normalization > 0) & (variance >= 0) & (count >= minimum_pixel_weight))
+    with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+        intensity = signal / normalization
+        relative_variance = (np.sqrt(variance) / signal) ** 2
+    valid &= np.isfinite(intensity) & (intensity > 0) & np.isfinite(relative_variance)
+    log_intensity = np.zeros_like(intensity)
+    np.log(intensity, out=log_intensity, where=valid)
+    edges = []
+    neighbors = [set() for _ in range(n_positions)]
+    for i in range(n_positions):
+        for j in range(i + 1, n_positions):
+            with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+                log_variance = relative_variance[i] + relative_variance[j] + floor_variance
+                bin_weight = 1.0 / log_variance
+            selected = valid[i] & valid[j] & np.isfinite(bin_weight) & (bin_weight > 0)
+            n_bins = int(selected.sum())
+            if n_bins < minimum_overlap_bins:
+                continue
+            weights = bin_weight[selected]
+            weight = float(weights.sum())
+            if not np.isfinite(weight):
+                raise ValueError("Nonfinite total overlap edge weight")
+            delta = float(np.dot(weights / weight, log_intensity[i, selected] - log_intensity[j, selected]))
+            edges.append({"i": i, "j": j, "n_bins": n_bins, "delta": delta, "weight": weight})
+            neighbors[i].add(j)
+            neighbors[j].add(i)
+
+    components = []
+    unseen = set(range(n_positions))
+    while unseen:
+        pending = [min(unseen)]
+        unseen.remove(pending[0])
+        component = []
+        while pending:
+            position = pending.pop()
+            component.append(position)
+            discovered = neighbors[position] & unseen
+            unseen.difference_update(discovered)
+            pending.extend(sorted(discovered))
+        components.append(sorted(component))
+    if len(components) != 1:
+        unsupported = [i for i in range(n_positions) if not neighbors[i]]
+        raise ValueError(f"Disconnected overlap graph: components={components}; unsupported positions={unsupported}")
+
+    design = np.zeros((len(edges), n_positions))
+    for row, edge in enumerate(edges):
+        design[row, edge["i"]] = 1.0
+        design[row, edge["j"]] = -1.0
+    weights = np.array([edge["weight"] for edge in edges])
+    delta = np.array([edge["delta"] for edge in edges])
+    root_weight = np.sqrt(weights / weights.max())
+    # Anchor the last position for the solve, then impose the equal-log gauge.
+    solution, _, rank, _ = np.linalg.lstsq(
+        design[:, :-1] * root_weight[:, None], delta * root_weight, rcond=None)
+    if rank != n_positions - 1:
+        raise ValueError("Overlap graph is numerically rank deficient")
+    log_gains = np.r_[solution, 0.0]
+    log_gains -= log_gains.mean()
+    with np.errstate(over="ignore", under="ignore"):
+        gains = np.exp(log_gains)
+    if not np.all(np.isfinite(gains) & (gains > 0)):
+        raise ValueError("Overlap solution does not yield finite positive gains")
+    residual = delta - design @ log_gains
+    for edge, after in zip(edges, residual):
+        edge.update({"residual_before": edge["delta"], "residual_after": float(after)})
+    normalized_weights = (weights / weights.max())
+    normalized_weights /= normalized_weights.sum()
+    return {
+        "frame_gains": gains, "edges": edges,
+        "components": components, "n_components": len(components),
+        "n_positions": n_positions, "n_edges": len(edges),
+        "position_valid_bins": valid.sum(axis=1).tolist(),
+        "position_edge_counts": [len(adjacent) for adjacent in neighbors],
+        "n_pair_bins": sum(edge["n_bins"] for edge in edges),
+        "edge_rms_before": float(np.sqrt(np.mean(delta**2))),
+        "edge_rms_after": float(np.sqrt(np.mean(residual**2))),
+        "weighted_edge_rms_before": float(np.sqrt(np.dot(normalized_weights, delta**2))),
+        "weighted_edge_rms_after": float(np.sqrt(np.dot(normalized_weights, residual**2))),
+        "settings": {"minimum_pixel_weight": float(minimum_pixel_weight),
+                     "minimum_overlap_bins": int(minimum_overlap_bins),
+                     "fractional_floor": float(fractional_floor)},
+        "gauge": "equal-position mean log(frame_gains) = 0",
+        "uncertainty": "Correlated overlap edges; no calibrated scale standard errors",
+    }
+
+
+def apply_position_scales(processed, gains) -> dict:
+    """Return a new processed payload with normalization multiplied by gains.
+
+    The original processed frame_gains must be exactly unity, not merely close.
+    Signal, variance and pixel count are unchanged in every group, including
+    merged_q and merged_2theta. Recompute merged I=S/N and sigma=sqrt(V)/N;
+    sigma is conditional on the fitted scales and EXCLUDES their uncertainty.
+    Preserve other metadata (including masks, axes and fit-range flags).
+    Remove top-level/group 'results': underlying pyFAI objects would be stale.
+    Input arrays/dictionaries are never written to; unchanged metadata may be
+    shared with the returned payload.
+    """
+    try:
+        gains = np.asarray(gains, dtype=float)
+        original_gains = np.asarray(processed["frame_gains"], dtype=float)
+        groups = processed["groups"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("processed requires groups and unity frame_gains; gains must be numeric") from error
+    if (gains.ndim != 1 or gains.size == 0
+            or not np.all(np.isfinite(gains) & (gains > 0))):
+        raise ValueError("gains must be a nonempty finite positive 1D array")
+    if original_gains.shape != gains.shape or not np.all(original_gains == 1.0):
+        raise ValueError("Original frame_gains must be exactly unity and match gains length (no double application)")
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("processed groups must be a nonempty dict")
+    updated_groups = {}
+    for name, group in groups.items():
+        frames = _position_accumulators(group)
+        if frames.shape[0] != gains.size:
+            raise ValueError(f"{name}: position count must match gains length")
+        if (not np.all(np.isfinite(frames)) or np.any(frames[:, 1:] < 0)):
+            raise ValueError(f"{name}: accumulators must be finite with nonnegative normalization, variance and count")
+        scaled = frames.copy()
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            scaled[:, 1] *= gains[:, None]
+            totals = scaled.sum(axis=0)
+        if (not np.all(np.isfinite(totals)) or not np.all(np.isfinite(scaled))
+                or np.any((frames[:, 1] > 0) & (scaled[:, 1] <= 0))):
+            raise ValueError(f"{name}: scaled normalization/accumulators overflow or underflow")
+        supported = totals[1] > 0
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            intensity = np.divide(totals[0], totals[1], out=np.full(totals.shape[1], np.nan), where=supported)
+            sigma = np.divide(np.sqrt(totals[2]), totals[1], out=np.full(totals.shape[1], np.nan), where=supported)
+        if not np.all(np.isfinite(intensity[supported]) & np.isfinite(sigma[supported])):
+            raise ValueError(f"{name}: scaled intensity/sigma must be finite in supported bins")
+        updated_groups[name] = {key: value for key, value in group.items() if key != "results"}
+        updated_groups[name].update(per_frame=scaled, accumulators=totals, intensity=intensity, sigma=sigma)
+    updated = {key: value for key, value in processed.items() if key != "results"}
+    updated.update(groups=updated_groups, frame_gains=gains.copy())
+    return updated
+
+
+def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range, npt, saturation=1e7,
+                      *, validate_frame_gains=True):
+    """Compare responses, optionally inferring frame gains from lower-Q pixels.
+
+    Disabling frame-gain validation removes the lower-Q support requirement
+    and gain-corrected result; frame rows report unity gains. Higher-Q scoring
+    uses the same cutoff and support requirements in either mode.
+    """
+    results = {"physical_only": {}, "detector_only": {}}
+    if validate_frame_gains:
+        results["lower_q_frame_gain"] = {}
     high_q_scores = {label: [] for label in results}
     frame_rows = []
     step = (q_range[1] - q_range[0]) / npt
@@ -432,16 +641,22 @@ def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range,
         for index in test_indices:
             index = int(index)
             frame = cache[index]
-            pixels, bins = frame["pixels"], frame["bins"]
-            log_gain = np.log(fit["combined_divisor"].ravel()[pixels])
-            residual = np.log(frame["counts"] + 0.5) - frame["log_norm"] - fit["profile_log"][bins] - log_gain
+            bins = frame["bins"]
             cutoff = int(np.quantile(np.unique(bins), 0.4))
-            selected = (bins <= cutoff) & ~fit["bad_pixel_mask"].ravel()[pixels]
-            if selected.sum() < 100:
-                raise ValueError("Too few lower-q pixels for independent frame-gain validation")
-            inferred_gain = float(np.exp(np.clip(np.median(residual[selected]), -0.05, 0.05)))
+            inferred_gain = 1.0
+            variants = [("physical_only", np.ones(scan.shape), 1.0),
+                        ("detector_only", fit["combined_divisor"], 1.0)]
+            if validate_frame_gains:
+                pixels = frame["pixels"]
+                log_gain = np.log(fit["combined_divisor"].ravel()[pixels])
+                residual = np.log(frame["counts"] + 0.5) - frame["log_norm"] - fit["profile_log"][bins] - log_gain
+                selected = (bins <= cutoff) & ~fit["bad_pixel_mask"].ravel()[pixels]
+                if selected.sum() < 100:
+                    raise ValueError("Too few lower-q pixels for independent frame-gain validation")
+                inferred_gain = float(np.exp(np.clip(np.median(residual[selected]), -0.05, 0.05)))
+                variants.append(("lower_q_frame_gain", fit["combined_divisor"], inferred_gain))
             counts = file[scan.detector_dataset][index]
-            for label, divisor, gain in (("physical_only", np.ones(scan.shape), 1.0), ("detector_only", fit["combined_divisor"], 1.0), ("lower_q_frame_gain", fit["combined_divisor"], inferred_gain)):
+            for label, divisor, gain in variants:
                 result = integrate_frame(model, counts, scan.angles[index], scan.i0[index], base_mask | fit["bad_pixel_mask"], divisor, npt, q_range, frame_gain=gain, saturation=saturation)
                 results[label][index] = result
                 high = (np.arange(npt) > cutoff + 2) & (result.count >= 100) & (result.intensity > 0) & fit["supported_q_bins"]
