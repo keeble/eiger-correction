@@ -180,8 +180,54 @@ def _geometry_from_config(config):
         return Goniometer.sload(file.name)
 
 
+def validate_azimuth_range(azimuth_range):
+    """Normalize a directed, inclusive chi wedge in degrees; None keeps all chi.
+
+    Bounds may cross the +/-180-degree seam, e.g. (170, -170). Equal
+    endpoints are invalid; a +/-360-degree span explicitly selects all chi.
+    """
+    if azimuth_range is None:
+        return None
+    message = "azimuth_range must be None or two finite degree bounds with 0 < width <= 360"
+    try:
+        limits = np.asarray(azimuth_range, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError(message) from error
+    if limits.shape != (2,) or not np.all(np.isfinite(limits)):
+        raise ValueError(message)
+    lower, upper = map(float, limits)
+    if not 0 < abs(upper - lower) <= 360:
+        raise ValueError(message)
+    return lower, upper
+
+
+def azimuth_mask(model, angle, integrator=None):
+    """True outside the model's chi wedge, evaluated at this motor position.
+
+    This is a pixel-centre mask, not fractional clipping at wedge boundaries.
+    It is geometry dependent and must never be folded into a fixed pixel mask.
+    Models without an azimuth_range attribute retain legacy all-chi behaviour.
+    """
+    limits = validate_azimuth_range(getattr(model, "azimuth_range", None))
+    if limits is None:
+        return np.zeros(model.shape, dtype=bool)
+    if integrator is None:
+        integrator = model.geometry.get_ai(float(angle))
+    chi = np.rad2deg(integrator.center_array(model.shape, unit="chi_rad"))
+    lower, upper = limits
+    if abs(upper - lower) == 360:
+        return ~np.isfinite(chi)
+    width = (upper - lower) % 360
+    offset = (chi - lower) % 360
+    # Include endpoints despite radian/degree round-off, including at the seam.
+    inside = (offset <= width + 1e-10) | (offset >= 360 - 1e-10)
+    return ~np.isfinite(chi) | ~inside
+
+
 class PhysicalModel:
-    def __init__(self, geometry_config, scan, polarization=0.95, density=6.2):
+    def __init__(self, geometry_config, scan, polarization=0.95, density=6.2,
+                 azimuth_range=None):
+        self.azimuth_range = validate_azimuth_range(azimuth_range)
         self.config = geometry_config
         self.geometry = _geometry_from_config(geometry_config)
         if not np.isclose(self.geometry.wavelength, scan.wavelength_m, rtol=1e-6, atol=0):
@@ -227,7 +273,7 @@ class PhysicalModel:
 def integrate_frame(model, counts, angle, monitor, mask, divisor, npt, radial_range, unit="q_nm^-1", frame_gain=1.0, saturation=1e7):
     integrator, q_pixels, norm, absorption, prefactor = model.arrays(angle)
     counts = np.asarray(counts, dtype=float)
-    bad = mask | ~np.isfinite(counts) | (counts < 0) | (counts >= saturation)
+    bad = mask | azimuth_mask(model, angle, integrator) | ~np.isfinite(counts) | (counts < 0) | (counts >= saturation)
     if not np.any(~bad):
         raise ValueError("Frame has no unmasked pixels")
     if not np.isfinite(frame_gain) or frame_gain <= 0:
@@ -254,7 +300,7 @@ def build_cache(scan, model, base_mask, q_range=(200, 400), npt=800, saturation=
         for index, angle in enumerate(scan.angles):
             integrator, q_pixels, norm, absorption, prefactor = model.arrays(angle)
             counts = file[scan.detector_dataset][index]
-            valid = ~base_mask & np.isfinite(counts) & (counts < saturation)
+            valid = ~(base_mask | azimuth_mask(model, angle, integrator)) & np.isfinite(counts) & (counts < saturation)
             valid &= (q_pixels >= q_range[0]) & (q_pixels < q_range[1])
             if valid.any():
                 pixels = np.flatnonzero(valid).astype(np.int32)
@@ -670,6 +716,9 @@ def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range,
 
 
 def save_calibration(path, scan, model, fit, base_mask, sensor_ids, fit_settings, validation):
+    # Persist the actual model selection even for callers other than the notebook.
+    fit_settings = {**fit_settings,
+                    "azimuth_range_deg": validate_azimuth_range(getattr(model, "azimuth_range", None))}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "x") as file:
@@ -734,7 +783,9 @@ def model_for_processing(scan, calibration):
             raise ValueError(f"Scan/calibration {name} mismatch; do not silently transfer this calibration")
     if scan.material != _text(physical["material"]) or scan.orientation != physical["orientation"]:
         raise ValueError("Scan/calibration material or detector orientation mismatch")
-    model = PhysicalModel(calibration["geometry"], scan, float(physical["polarization_factor"]), float(physical["density_g_cm3"]))
+    model = PhysicalModel(calibration["geometry"], scan, float(physical["polarization_factor"]),
+                          float(physical["density_g_cm3"]),
+                          azimuth_range=calibration["fit_settings"].get("azimuth_range_deg"))
     np.testing.assert_allclose(model.transmission, physical["normal_transmission"], rtol=1e-6)
     model.vertical_check()
     return model
@@ -744,7 +795,8 @@ def theta_range_for_scan(scan, model, mask, theta_max=None):
     """Return (0, maximum) 2theta degrees without reading detector counts.
 
     The automatic maximum uses finite, unmasked pyFAI pixel centres over all
-    scan positions, not pixel corners or count-dependent frame masks.
+    scan positions, including the model's per-position azimuth wedge, not
+    pixel corners or count-dependent frame masks.
     """
     message = "theta_max must be None or a finite number with 0 < theta_max <= 180 degrees"
     if theta_max is not None:
@@ -763,7 +815,7 @@ def theta_range_for_scan(scan, model, mask, theta_max=None):
     for angle in scan.angles:
         integrator = model.geometry.get_ai(float(angle))
         theta = np.rad2deg(integrator.center_array(scan.shape, unit="2th_rad"))
-        valid = ~mask & np.isfinite(theta)
+        valid = ~(mask | azimuth_mask(model, angle, integrator)) & np.isfinite(theta)
         if np.any(valid):
             upper = max(upper, float(theta[valid].max()))
     if not np.isfinite(upper) or not 0 < upper <= 180:
@@ -815,7 +867,8 @@ def process_scan(scan, calibration, model, q_range=(200, 400), q_npt=800, theta_
         np.testing.assert_allclose(group["per_frame"].sum(axis=0), group["accumulators"])
         q_values = group["axis"] if name == "merged_q" else 4 * np.pi * np.sin(np.deg2rad(group["axis"]) / 2) / (model.geometry.wavelength * 1e9)
         group["within_fit_range"] = (q_values >= fit_range[0]) & (q_values <= fit_range[1])
-    return {"groups": payload, "frame_gains": gains, "mask": mask, "saturation": saturation, "results": results}
+    return {"groups": payload, "frame_gains": gains, "mask": mask, "saturation": saturation, "results": results,
+            "azimuth_range_deg": validate_azimuth_range(getattr(model, "azimuth_range", None))}
 
 
 def save_processed(path, scan, calibration, model, processed):
@@ -847,6 +900,8 @@ def save_processed(path, scan, calibration, model, processed):
         for name in ("pixel_divisor", "sensor_divisor", "sensor_gains", "combined_divisor", "bad_pixel_mask"):
             correction.create_dataset(name, data=calibration[name], compression="gzip")
         correction.create_dataset("applied_fixed_mask", data=processed["mask"], compression="gzip")
+        correction.attrs["azimuth_range_deg_json"] = json.dumps(processed.get("azimuth_range_deg"))
+        correction.attrs["azimuth_mask_convention"] = "pyFAI chi degrees; inclusive pixel-centre wedge evaluated per motor position"
         correction.attrs["source_calibration_scan"] = calibration["source_scan"]
         physical = entry.create_group("physical_corrections")
         for name, value in calibration["physical"].items():
