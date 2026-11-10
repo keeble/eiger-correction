@@ -2,14 +2,11 @@ name: eiger-correction
 channels:
   - conda-forge
 dependencies:
-  - python=3.13
-  - numpy>=2,<2.3
+  - python>=3.13,<3.15
+  - numpy>=2
   - scipy
   - h5py
-  - pandas
   - matplotlib
-  - pyfai=2024.9.0
+  - pyfai>=2024.9
   - xraylib
-  - ipykernel
-  - ipywidgets
-  - jupyterlab
+  - hdf5plugin

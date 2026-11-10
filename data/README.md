@@ -1,13 +1,19 @@
 # Local Input Data
 
-Place scan inputs here, or edit the notebook path settings to point elsewhere. Raw data are intentionally excluded from Git.
+The CLI accepts a scan path and, optionally, a geometry JSON override. Without
+`--geometry`, it decodes the JSON blob at `/entry/plan_metadata/geometry_calibration`
+in the NeXus scan directly. An explicit file takes precedence. Inputs can remain
+on read-only beamline storage; the CLI never writes beside the source scan.
 
-For the default extraction settings, provide:
+For a NeXus stem NAME, companion paths default to NAME-fastcs_eiger_000001.h5
+(detector dataset `data`), NAME-i0.h5 (monitor dataset `entry/data/data`), and
+NAME-fastcs_eiger_meta.h5 (detector mask/material/energy/thickness). If the default
+detector file is absent the loader uses the linked NeXus detector dataset.
+The CLI supports explicit companion-path overrides.
 
-- `i15-1-99877.nxs`
-- `i15-1-99877-fastcs_eiger_000001.h5`
-- `i15-1-99877-i0.h5`
-- `i15-1-99877-fastcs_eiger_meta.h5`
-- `i15-1-98779_2026-10-01_11-51-17_eiger_goniometer_calibration.json`
+The bundled geometry is the October 15, 2026 goniometer calibration used for the
+scan-100605 smoke test. Geometry must match the scan's wavelength and orientation;
+do not treat that example as valid for every acquisition.
 
-For the default processing example, also provide scan `i15-1-99878` and its matching `.nxs`, detector, monitor, and metadata files. Companion filenames are inferred from each NeXus filename stem.
+Raw detector and NeXus data are intentionally excluded from Git. Generated data
+belong in a new run directory, normally under outputs, not here.

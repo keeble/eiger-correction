@@ -1,4 +1,4 @@
-"""Shared raw EIGER calibration and processing routines for the companion notebooks."""
+"""Raw EIGER calibration and processing routines for the extraction CLI."""
 
 from __future__ import annotations
 
@@ -762,7 +762,7 @@ def load_calibration(path):
     path = Path(path).resolve()
     with h5py.File(path, "r") as file:
         if file.attrs.get("schema") != SCHEMA:
-            raise ValueError("Unsupported calibration schema; use extract_eiger_corrections.ipynb")
+            raise ValueError(f"Unsupported calibration schema; expected {SCHEMA}")
         correction = file["corrections"]
         payload = {name: _array(correction, name) for name in ("combined_divisor", "pixel_divisor", "sensor_divisor", "sensor_gains", "bad_pixel_mask", "base_mask", "sensor_ids")}
         payload.update({"path": path, "geometry": json.loads(_text(file["geometry_json"][()])),
@@ -918,6 +918,6 @@ def save_processed(path, scan, calibration, model, processed):
             valid = totals[1] > 0
             np.testing.assert_allclose(group["intensity"][()][valid], totals[0, valid] / totals[1, valid])
             np.testing.assert_allclose(group["sigma"][()][valid], np.sqrt(totals[2, valid]) / totals[1, valid])
+            np.testing.assert_array_equal(group["frame_intensity_gains"][()], processed["frame_gains"])
         np.testing.assert_array_equal(file["entry/calibration/combined_divisor"][()], calibration["combined_divisor"])
-        np.testing.assert_array_equal(file["entry/merged_q/frame_intensity_gains"][()], processed["frame_gains"])
     return path.resolve()
