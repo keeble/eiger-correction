@@ -449,8 +449,7 @@ class DiagnosticSmokeTests(TemporaryCase):
                 self.root, raw, scan, groups, model, unity["mask"], fit, unity, final, scale,
                 theta_range=(30., 80.), diagnostic_range=(30., 80.), min_pixel_weight=100, dpi=35)
         expected = {"angle_grouping", "azimuth_geometry", "detector_response", "sampling_q",
-                    "position_gains", "final_xy", "overlap_final_abcd", "overlap_before_after_be",
-                    "residuals_last10"}
+                    "position_gains", "final_xy", "overlap_final_abcd"}
         self.assertEqual({Path(name).stem for name in summary["figures"]}, expected)
         self.assertEqual(summary["skips"], [])
         self.assertEqual(summary["warnings"], [])
@@ -466,8 +465,11 @@ class DiagnosticSmokeTests(TemporaryCase):
         self.assertTrue(all(row["overlap_bins"] == 8 for row in summary["residuals"]["final"]))
         json.dumps(summary, allow_nan=False)
         integrate.assert_not_called()
-        self.assertEqual(apply.call_count, 1)
-        np.testing.assert_array_equal(apply.call_args.args[1], fit["frame_gains"])
+        apply.assert_not_called()
+        self.assertEqual(set(summary["residuals"]), {"final"})
+        expected_residuals = diagnostics.position_overlap_diagnostics(final["groups"]["merged_2theta"])
+        for row, residuals in zip(summary["residuals"]["final"], expected_residuals["residual"]):
+            self.assertAlmostEqual(row["mean_percent"], float(np.mean(residuals)))
 
     def test_figure_closed_if_jpeg_save_fails(self):
         import matplotlib.pyplot as plt

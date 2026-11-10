@@ -71,11 +71,14 @@ Existing dataset paths remain valid; additional hard links do not copy arrays.
 	no redundant Q integration.
 - **Two-column XY:** 2theta degrees and intensity, ten significant digits;
 	unsupported bins are omitted, not filled or interpolated.
-- **Nine JPEGs:** actual angle grouping; geometry-only azimuth masks; response
+- **Seven JPEGs:** actual angle grouping; geometry-only azimuth masks; response
 	maps/sensor gains/monitors; Q sampling; stage-1/final gains; full/zoom intensity;
-	final overlap panels A–D; matched before/after B/E; motor-aligned residuals for
-	the last ten positions. Unsupported diagnostic intervals are recorded as skips
+	final overlap panels A–B **after final applied gains**, using the same final
+	integration as the exported pattern. Unsupported intervals are recorded as skips
 	and warnings rather than invalidating an otherwise supported extraction.
+	The overlap figure notes that individual curves may spike where few pixels
+	contribute; A retains all supported bins, while B uses the diagnostic
+	pixel-weight threshold. The historical JPEG filename is retained for existing links.
 - **JSON run report:** status, inputs, software versions and source/geometry
 	hashes, settings, per-stage timing, validation metrics, fit history, all gains,
 	graph edges/support, residual summaries, output names, warnings and exceptions.
@@ -157,7 +160,7 @@ Useful after geometry, masking or integration-code changes; normally unnecessary
 for every scan after acceptance testing.
 
 **Interpretation:** held-out tests probe detector generalization within this scan,
-not transfer to another scan. Stage-2 overlap residuals and before/after plots are
+not transfer to another scan. Stage-2 overlap residuals are
 **in-sample descriptive diagnostics**, not independent validation or calibrated
 uncertainties. Recommended further acceptance testing is independent scans or a
 known reference and, if stage-2 generalization must be quantified, a separately

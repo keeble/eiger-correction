@@ -37,6 +37,13 @@ class MarkdownReportTests(unittest.TestCase):
                          "Review support \\| inspect &lt;mask&gt;"):
             self.assertIn(expected, text)
 
+    def test_overlap_caption_explains_low_support_and_final_gains(self):
+        text = render_markdown({"diagnostics": {"figures": ["overlap_final_abcd.jpg"]}})
+        self.assertIn("Low-support spikes", text)
+        self.assertIn("very few pixels", text)
+        self.assertIn("Both panels use the final applied gains", text)
+        self.assertIn("geometric support, not photon counts", text)
+
     def test_exception_fence_and_atomic_replacement(self):
         record = {"status": "failed", "error": {"type": "ValueError", "message": "bad input",
                                                  "traceback": "Failure with ``` embedded"}}

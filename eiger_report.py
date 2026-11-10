@@ -139,14 +139,18 @@ def render_markdown(record):
         "sampling_q": "Count-valid sampling and position coverage",
         "position_gains": "Stage-1 nuisance gains versus final position divisors",
         "final_xy": "Final intensity pattern — full range and high-angle zoom",
-        "overlap_final_abcd": "Final overlap diagnostics (in-sample)",
-        "overlap_before_after_be": "Before/after overlap residuals and influence (in-sample)",
-        "residuals_last10": "Motor-aligned residuals — highest ten positions (in-sample)",
+        "overlap_final_abcd": "Position curves and overlap residuals after final gains (in-sample)",
     }
     for filename in diagnostic.get("figures", []):
         title = titles.get(Path(filename).stem, Path(filename).stem.replace("_", " "))
         target = quote(str(filename), safe="/")
         paragraph(f"### {_text(title)}\n\n[{_text(filename)}]({target})\n\n![{title}]({target})")
+        if Path(filename).stem == "overlap_final_abcd":
+            paragraph("**Low-support spikes:** individual-position curves can spike where very few pixels contribute, "
+                      "especially near coverage edges. Panel A includes all supported bins; panel B applies the "
+                      "diagnostic pixel-weight threshold to both the position and its reference. "
+                      "Pixel weights describe geometric support, not photon counts. Such spikes alone do not "
+                      "establish a correction defect. Both panels use the final applied gains.")
     if not diagnostic.get("figures"):
         paragraph("No completed diagnostic gallery recorded yet.")
     if diagnostic.get("skips"):

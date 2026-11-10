@@ -283,91 +283,32 @@ def _decorate(axes, diagnostic_range, boundaries):
                 ax.axvline(boundary, color="0.4", linestyle=":", linewidth=1)
 
 
-def _overlap_plots(directory, summary, group, before, final, angles, window,
+def _overlap_plots(directory, summary, group, final, angles, window,
                    diagnostic_range, colors, boundaries, dpi):
     x = np.asarray(group["axis"])
     intensity = np.asarray(group["intensity"])
-    totals = np.asarray(group["accumulators"])
-    with _figure(directory, summary, "overlap_final_abcd", dpi, figsize=(15, 14)) as fig:
-        axes = fig.subplots(4, 1, sharex=True)
+    # Keep the existing filename so links in previously generated reports work.
+    with _figure(directory, summary, "overlap_final_abcd", dpi, figsize=(15, 8)) as fig:
+        axes = fig.subplots(2, 1, sharex=True)
         for i in range(len(angles)):
             for ax, field in zip(axes[:2], ("curves", "residual")):
                 ax.plot(x[window], final[field][i, window], color=colors[i], alpha=.7, linewidth=.7)
         axes[0].plot(x[window], intensity[window], color="black", linewidth=1.5, label="Final merge")
-        axes[0].set(title="A · Final integrated curves by motor position", ylabel="Intensity (a.u.)")
+        axes[0].set(title="A · Individual-position curves (including low pixel support) and final merge",
+                ylabel="Intensity (a.u.)")
         axes[0].legend()
         axes[1].axhline(0, color="black", linewidth=.8)
-        axes[1].set(title="B · Position minus all OTHER positions", ylabel="Overlap residual (%)")
-        mesh = axes[2].pcolormesh(x, np.arange(len(angles)), final["fraction"],
-                                 shading="nearest", cmap="viridis", vmin=0, vmax=1)
-        axes[2].set(title="C · Actual final normalization contribution", ylabel="Position index")
-        ticks = np.arange(0, len(angles), max(1, len(angles) // 10))
-        axes[2].set_yticks(ticks, [f"{i}: {angles[i]:.2f}°" for i in ticks])
-        fig.colorbar(mesh, ax=axes[2], label="Normalization fraction")
-        mid = .5 * (x[:-1] + x[1:])
-        pair_mean = .5 * (intensity[:-1] + intensity[1:])
-        valid = ((totals[1, :-1] > 0) & (totals[1, 1:] > 0)
-                 & np.isfinite(pair_mean) & (pair_mean > 0))
-        step = np.divide(100 * np.diff(intensity), pair_mean,
-                         out=np.full_like(pair_mean, np.nan, dtype=float), where=valid)
-        mix = .5 * np.sum(np.abs(np.diff(final["fraction"], axis=1)), axis=0)
-        mix[~valid] = np.nan
-        selected = window[:-1] & window[1:]
-        axes[3].plot(mid[selected], step[selected], color="black", linewidth=.8)
-        axes[3].set(title="D · Unsmooth adjacent-bin and contribution-mix changes",
-                    xlabel="2θ (degrees)", ylabel="Intensity change (%)")
-        twin = axes[3].twinx()
-        twin.plot(mid[selected], mix[selected], color="tab:orange", alpha=.75, linewidth=.9)
-        twin.set_ylabel("Change in contribution mix (0–1)", color="tab:orange")
+        axes[1].set(title="B · Position minus all OTHER positions · pixel-support filtered",
+                    xlabel="2θ (degrees)", ylabel="Overlap residual (%)")
         _decorate(axes, diagnostic_range, boundaries)
-        fig.suptitle("Final overlap diagnostics · measured I0 retained; dotted lines: detector-fit limits")
-    with _figure(directory, summary, "overlap_before_after_be", dpi, figsize=(16, 8)) as fig:
-        axes = fig.subplots(2, 2, sharex=True, sharey="row")
-        for col, (state, label) in enumerate(((before, "Before: stage-1 nuisance gains"),
-                                             (final, "After: final applied gains"))):
-            for row, field in enumerate(("residual", "influence")):
-                for i in range(len(angles)):
-                    axes[row, col].plot(x[window], state[field][i, window], color=colors[i], alpha=.7, linewidth=.8)
-                axes[row, col].axhline(0, color="black", linewidth=.8)
-            axes[0, col].set_title(label)
-            axes[1, col].set_xlabel("2θ (degrees)")
-        axes[0, 0].set_ylabel("B · Overlap residual (%)")
-        axes[1, 0].set_ylabel("E · Change vs leaving position out (%)")
-        _decorate(axes.flat, diagnostic_range, boundaries)
-        fig.suptitle("Same bins and fixed detector response · shared y limits per row · no centering/smoothing")
-        fig.supxlabel("E = B × actual normalization fraction, recomputed per stage. In-sample, not uncertainty.")
-
-
-def _stack_plot(directory, summary, x, final, angles, window, diagnostic_range, colors, dpi):
-    indices = np.argsort(angles, kind="stable")[-10:]
-    residuals = final["residual"][indices][:, window]
-    relative_x = x[window][None, :] - angles[indices, None]
-    finite = np.isfinite(residuals) & np.isfinite(relative_x)
-    if not finite.any():
-        _skip(summary, "residuals_last10", "No supported overlap residuals for the ten highest motor positions")
-        return
-    spacing = max(.05, 1.15 * float(np.ptp(residuals[finite])))
-    offsets = np.arange(len(indices)) * spacing
-    summary["stack"] = {"positions": indices.tolist(), "offset_percent": spacing}
-    with _figure(directory, summary, "residuals_last10", dpi, figsize=(15, 10)) as fig:
-        ax = fig.subplots()
-        for row, i in enumerate(indices):
-            ax.axhline(offsets[row], color=colors[i], linestyle=":", linewidth=.6, alpha=.5)
-            ax.plot(relative_x[row], residuals[row] + offsets[row], color=colors[i], linewidth=1)
-            if not finite[row].any():
-                _skip(summary, f"residuals_last10_position_{i}", "No supported residuals; baseline only")
-        ax.set_yticks(offsets, [f"{i}: {angles[i]:.3f}° motor" for i in indices])
-        ax.set(xlabel="Scattering 2θ − motor position (degrees)",
-               ylabel="Motor position · overlap residual (%) + display offset",
-               title=f"F · Final residuals: {len(indices)} highest motor-angle positions, motor-aligned")
-        lower, upper = float(relative_x[finite].min()), float(relative_x[finite].max())
-        if lower < upper:
-            ax.set_xlim(lower, upper)
-        ax.secondary_yaxis("right").set_ylabel("Residual + display offset (percentage points)")
-        ax.grid(axis="x", alpha=.2)
-        fig.supxlabel(f"Original scattering selection: {diagnostic_range}°; offset: {spacing:.4g} percentage points.\n"
-                      "No interpolation, centering, amplitude normalization or smoothing. Motor-relative angle is not a pixel coordinate.",
-                      fontsize=9)
+        fig.suptitle("After final applied gains · measured I0 retained; dotted lines: detector-fit limits")
+        fig.supxlabel(
+            "Individual-position curves can spike where very few pixels contribute, especially near coverage edges.\n"
+            "A shows all supported bins; B applies the diagnostic pixel-weight threshold to both position and reference.\n"
+            "Pixel-splitting weights are geometric support, not photon counts. Spikes are not by themselves evidence of a correction defect.\n"
+            "Residuals are in-sample diagnostics, not independent validation or uncertainty estimates.",
+            fontsize=9,
+        )
 
 
 def _gains_plot(directory, summary, scan, fit, processed_final, dpi):
@@ -424,9 +365,9 @@ def save_diagnostics(output_directory: Path, raw_scan, scan, frame_groups, model
 
     ``frame_groups`` lists raw-frame indices for each analysis position, in
     ``scan.angles`` order, including singleton groups when not aggregating.
-    ``processed_unity`` must carry unity frame_gains; stage-1 comparison scales
-    are applied exactly once. Only ``groups['merged_2theta']`` is used from the
-    final payload. ``scale_fit`` may be None or omit graph/RMS metadata.
+    ``processed_unity`` supplies sampling metadata only. Curves and residuals
+    use ``processed_final['groups']['merged_2theta']``, after the final gains.
+    No scales are applied here. ``scale_fit`` may omit graph/RMS metadata.
 
     Optional ``processed_unity['sampling']`` contains observations_by_position
     (integer positions × bins), group_sizes, and theta_edges (degrees). It must
@@ -464,17 +405,12 @@ def save_diagnostics(output_directory: Path, raw_scan, scan, frame_groups, model
     group = processed_final["groups"]["merged_2theta"]
     _xy_plot(directory, summary, group, theta_range, diagnostic_range, dpi)
 
-    # This is the only scale application; never refit, reintegrate or stack
-    # stage-1 gains on the final overlap gains. Workflow owns input validation.
-    before_processed = workflow.apply_position_scales(processed_unity, fit["frame_gains"])
-    before = position_overlap_diagnostics(before_processed["groups"]["merged_2theta"], min_pixel_weight)
-    del before_processed
+    # Inspect the final exported integration without reapplying any gains.
     final = position_overlap_diagnostics(group, min_pixel_weight)
     x = np.asarray(group["axis"], dtype=float)
     angles = np.asarray(scan.angles, dtype=float)
     window = (x >= diagnostic_range[0]) & (x <= diagnostic_range[1])
-    summary["residuals"] = {"before": _residual_summary(before, window, angles),
-                            "final": _residual_summary(final, window, angles)}
+    summary["residuals"] = {"final": _residual_summary(final, window, angles)}
     summary["scale_fit"] = {}
     for key in ("n_positions", "n_edges", "n_components", "n_pair_bins", "edge_rms_before",
                 "edge_rms_after", "weighted_edge_rms_before", "weighted_edge_rms_after"):
@@ -489,15 +425,13 @@ def save_diagnostics(output_directory: Path, raw_scan, scan, frame_groups, model
     else:
         reason = None
     if reason is not None:
-        for name in ("overlap_final_abcd", "overlap_before_after_be", "residuals_last10"):
-            _skip(summary, name, reason)
+        _skip(summary, "overlap_final_abcd", reason)
         return summary
     colors = plt.get_cmap("turbo")(np.linspace(.03, .97, len(angles)))
     # Existing integration metadata identifies the detector-fit interval without
     # requiring another fit-range argument, geometry pass or Q integration.
     within_fit = np.asarray(group.get("within_fit_range", np.zeros(x.size, dtype=bool)), dtype=bool)
     boundaries = x[within_fit][[0, -1]] if within_fit.any() else []
-    _overlap_plots(directory, summary, group, before, final, angles, window,
+    _overlap_plots(directory, summary, group, final, angles, window,
                    diagnostic_range, colors, boundaries, dpi)
-    _stack_plot(directory, summary, x, final, angles, window, diagnostic_range, colors, dpi)
     return summary
