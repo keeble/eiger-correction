@@ -54,6 +54,14 @@ such as 170, −170 are supported. The opposite wedge is not implicitly included
 
 Every run directory contains:
 
+Both HDF5 exports include NeXus `NXentry`/`NXdata`, root/entry `default`,
+`signal` and `axes` tags for automatic plotting in readers such as DAWN.
+The pattern defaults to intensity versus 2theta (degrees), with conditional
+Poisson sigma linked as its uncertainties. The corrections file defaults to
+the combined pixel × sensor divisor image, with detector column/row pixel-index
+coordinates. Legacy dataset-level plot tags are included for older readers.
+Existing dataset paths remain valid; additional hard links do not copy arrays.
+
 - **Calibration HDF5:** detector/pixel/sensor divisors, fixed masks, geometry,
 	physical model, fit history and settings, held-out results, final source-only
 	position gains, and separately labelled stage-1 nuisance gains.

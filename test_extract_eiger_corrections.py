@@ -536,6 +536,34 @@ class SyntheticExtractionTests(TemporaryCase):
             unity, fit = self.synthetic_workflow(stack)
             code = cli.main(self.argv(directory, "--validation", "basic", "--fit-bins", "16", "--theta-bins", "8"))
         self.assert_exports(directory, code, unity, fit)
+        with h5py.File(directory / "pattern.h5", "r") as target:
+            entry = target[target.attrs["default"]]
+            self.assertEqual(entry.attrs["NX_class"], "NXentry")
+            group = entry[entry.attrs["default"]]
+            self.assertEqual(group.name, "/entry/merged_2theta")
+            self.assertEqual(group.attrs["NX_class"], "NXdata")
+            self.assertEqual(group.attrs["signal"], "intensity")
+            self.assertEqual(list(group.attrs["axes"]), ["two_theta_deg"])
+            self.assertEqual(group.attrs["two_theta_deg_indices"], 0)
+            self.assertEqual(group["two_theta_deg"].attrs["units"], "degrees")
+            self.assertEqual(group["intensity"].attrs["interpretation"], "spectrum")
+            self.assertEqual(group["intensity"].attrs["signal"], 1)
+            self.assertEqual(group["intensity_errors"].id, group["sigma"].id)
+        with h5py.File(directory / "detector_corrections.h5", "r") as target:
+            entry = target[target.attrs["default"]]
+            self.assertEqual(entry.attrs["NX_class"], "NXentry")
+            group = entry[entry.attrs["default"]]
+            self.assertEqual(group.id, target["corrections"].id)
+            self.assertEqual(group.attrs["NX_class"], "NXdata")
+            self.assertEqual(group.attrs["signal"], "combined_divisor")
+            self.assertEqual(list(group.attrs["axes"]), ["detector_row", "detector_column"])
+            signal = group[group.attrs["signal"]]
+            self.assertEqual(signal.attrs["interpretation"], "image")
+            self.assertEqual(signal.id, target["corrections/combined_divisor"].id)
+            for dimension, axis in enumerate(group.attrs["axes"]):
+                self.assertEqual(group.attrs[f"{axis}_indices"], dimension)
+                self.assertEqual(group[axis].shape, (signal.shape[dimension],))
+                np.testing.assert_array_equal(group[axis][()], np.arange(signal.shape[dimension]))
 
     def test_end_to_end_uses_embedded_geometry_by_default(self):
         directory = self.root / "embedded_extraction"

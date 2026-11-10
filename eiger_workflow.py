@@ -715,6 +715,63 @@ def validate_response(scan, model, cache, fit, test_indices, base_mask, q_range,
     return {"summary": summary, "frame_rows": frame_rows, "results": results}
 
 
+def _tag_nxdata(group, signal_name, axes, interpretation):
+    """Modern NeXus plot declarations plus legacy dataset tags for DAWN readers."""
+    group.attrs["NX_class"] = "NXdata"
+    group.attrs["signal"] = signal_name
+    group.attrs["axes"] = np.asarray(axes, dtype=h5py.string_dtype("utf-8"))
+    signal = group[signal_name]
+    signal.attrs["signal"] = 1
+    signal.attrs["axes"] = ":".join(axes)
+    signal.attrs["interpretation"] = interpretation
+    for dimension, name in enumerate(axes):
+        group.attrs[f"{name}_indices"] = dimension
+        group[name].attrs["axis"] = dimension + 1
+        group[name].attrs["primary"] = 1
+
+
+def _tag_calibration_plot(file):
+    """Link an NXentry default view to existing corrections without copying data."""
+    correction = file["corrections"]
+    for dimension, name, label in ((0, "detector_row", "Detector row (pixel index)"),
+                                   (1, "detector_column", "Detector column (pixel index)")):
+        if name not in correction:
+            correction.create_dataset(name, data=np.arange(correction["combined_divisor"].shape[dimension]))
+        correction[name].attrs["units"] = "1"
+        correction[name].attrs["long_name"] = label
+    _tag_nxdata(correction, "combined_divisor", ("detector_row", "detector_column"), "image")
+    correction["combined_divisor"].attrs["units"] = "1"
+    correction["combined_divisor"].attrs["long_name"] = "Combined pixel x sensor intensity divisor"
+    file.attrs["default"] = "entry"
+    entry = file.require_group("entry")
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs["default"] = "corrections"
+    if "corrections" not in entry:
+        entry["corrections"] = correction  # HDF5 hard link, not a second map.
+
+
+def _tag_pattern_plot(file):
+    """Select intensity versus scattering coordinate and label conditional sigma."""
+    file.attrs["default"] = "entry"
+    entry = file["entry"]
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs["default"] = "merged_2theta"
+    for name in ("merged_2theta", "merged_q"):
+        if name not in entry:
+            continue
+        group = entry[name]
+        axis_name = "q_nm" if name == "merged_q" else "two_theta_deg"
+        _tag_nxdata(group, "intensity", (axis_name,), "spectrum")
+        group[axis_name].attrs["units"] = "nm^-1" if name == "merged_q" else "degrees"
+        group[axis_name].attrs["long_name"] = "Q (nm^-1)" if name == "merged_q" else "Scattering 2theta (degrees)"
+        group["intensity"].attrs["long_name"] = "Normalized intensity (a.u.)"
+        group["sigma"].attrs["long_name"] = "Conditional Poisson sigma (a.u.)"
+        group["sigma"].attrs["uncertainty"] = UNCERTAINTY
+        group["intensity"].attrs["uncertainties"] = "sigma"
+        if "intensity_errors" not in group:
+            group["intensity_errors"] = group["sigma"]
+
+
 def save_calibration(path, scan, model, fit, base_mask, sensor_ids, fit_settings, validation):
     # Persist the actual model selection even for callers other than the notebook.
     fit_settings = {**fit_settings,
@@ -752,6 +809,7 @@ def save_calibration(path, scan, model, fit, base_mask, sensor_ids, fit_settings
         diagnostics.create_dataset("supported_q_bins", data=fit["supported_q_bins"])
         diagnostics.attrs["frame_gains_not_transferable"] = True
         diagnostics.attrs["validation_json"] = json.dumps(validation)
+        _tag_calibration_plot(file)
     loaded = load_calibration(path)
     for name in ("combined_divisor", "pixel_divisor", "sensor_divisor", "bad_pixel_mask"):
         np.testing.assert_array_equal(loaded[name], fit[name])
@@ -908,6 +966,7 @@ def save_processed(path, scan, calibration, model, processed):
             physical.attrs[name] = value
         physical.attrs["absolute_solid_angle"] = True
         entry.attrs["saturation_threshold"] = processed["saturation"]
+        _tag_pattern_plot(file)
     with h5py.File(path, "r") as file:
         for name, payload in processed["groups"].items():
             group = file[f"entry/{name}"]
